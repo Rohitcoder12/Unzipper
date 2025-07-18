@@ -1,20 +1,18 @@
-# bot.py
+# bot.py (Updated Version)
+
 import logging
 import os
 import io
 import zipfile
 import py7zr
-import shutil
 from telethon.sync import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl import types
 
 # --- Configuration from Heroku Config Vars ---
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
-# IMPORTANT: The BOT_TOKEN is NOT used here. The String Session authenticates you.
 SESSION_STRING = os.environ.get("STRING_SESSION")
-
-TEMP_DIR = "temp_downloads" # Used for extraction if in-memory fails
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,8 +20,17 @@ logger = logging.getLogger(__name__)
 # --- Initialize the Client with the String Session ---
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
+# --- NEW: Define who can use the bot (optional, but good practice) ---
+# If you want to restrict it to specific users, add their user IDs here.
+# For now, we will leave it empty to allow everyone.
+# ALLOWED_USERS = [12345678, 87654321]
+
 @client.on(events.NewMessage(pattern='/start'))
 async def start(event):
+    # --- NEW: Check if the sender is a bot ---
+    if event.sender.bot:
+        return
+
     await event.respond(
         "Hello! I am the advanced Unzipper Bot.\n\n"
         "Send me a ZIP or 7z file. I will process it in memory. "
@@ -32,6 +39,15 @@ async def start(event):
 
 @client.on(events.NewMessage(func=lambda e: e.document is not None))
 async def document_handler(event):
+    # --- NEW: Check if the sender is a bot. If so, do nothing. ---
+    if event.sender.bot:
+        return
+        
+    # --- OPTIONAL: Uncomment the lines below to restrict bot usage ---
+    # if event.sender_id not in ALLOWED_USERS:
+    #     await event.respond("Sorry, you are not authorized to use this bot.")
+    #     return
+
     doc = event.document
     file_name = doc.attributes[0].file_name
     
@@ -44,12 +60,10 @@ async def document_handler(event):
     status_message = await event.respond(f"Downloading `{file_name}` into memory...")
     
     try:
-        # 1. Download the file into an in-memory bytes buffer
         file_buffer = io.BytesIO(await event.download_media(file=bytes))
         await client.edit_message(status_message, "Download complete. Extracting from memory...")
 
-        # 2. Extract from the in-memory buffer
-        archive_name = "archive" # Placeholder
+        archive_name = "archive"
         if is_zip:
             archive = zipfile.ZipFile(file_buffer)
             file_list = archive.infolist()
@@ -60,21 +74,16 @@ async def document_handler(event):
         await client.edit_message(status_message, f"Found {len(file_list)} files. Starting upload...")
         
         file_count = 0
-        # 3. Iterate and upload each file
         for item in file_list:
-            if not (is_zip and item.is_dir()): # Skip directories for zipfile
-                # For zipfile, item is an info object. For py7zr, it has a 'filename' attribute.
+            if not (is_zip and item.is_dir()):
                 inner_filename = item.filename if is_zip else item.filename
 
-                # Read the inner file's content into another bytes buffer
                 if is_zip:
                     inner_file_bytes = archive.read(inner_filename)
                 elif is_7z:
-                    # py7zr needs a slightly different way to get the file data
                     all_files_dict = archive.readall()
                     inner_file_bytes = all_files_dict[inner_filename].read()
 
-                # Upload the bytes
                 await client.send_file(
                     event.chat_id,
                     file=inner_file_bytes,
@@ -87,10 +96,6 @@ async def document_handler(event):
     except Exception as e:
         logger.error(f"An error occurred: {e}", exc_info=True)
         await client.edit_message(status_message, f"An error occurred: {e}\n\nThis might be because the file is too large for Heroku's RAM.")
-    finally:
-        # No cleanup needed as we didn't use the disk
-        pass
-
 
 print("Bot is starting...")
 client.start()
