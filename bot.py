@@ -1,10 +1,11 @@
-# bot.py (Updated Version)
+# bot.py (Disk-based version for Heroku)
 
 import logging
 import os
 import io
 import zipfile
 import py7zr
+import shutil
 from telethon.sync import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl import types
@@ -14,39 +15,41 @@ API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 SESSION_STRING = os.environ.get("STRING_SESSION")
 
+# A temporary directory on Heroku's ephemeral disk
+TEMP_DIR = "temp_downloads"
+
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- Initialize the Client with the String Session ---
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-# --- NEW: Define who can use the bot (optional, but good practice) ---
-# If you want to restrict it to specific users, add their user IDs here.
-# For now, we will leave it empty to allow everyone.
-# ALLOWED_USERS = [12345678, 87654321]
+# --- Helper function to clean up files ---
+def cleanup(path):
+    if os.path.exists(path):
+        try:
+            shutil.rmtree(path)
+            logger.info(f"Successfully cleaned up directory: {path}")
+        except OSError as e:
+            logger.error(f"Error during cleanup of {path}: {e.strerror}")
 
 @client.on(events.NewMessage(pattern='/start'))
 async def start(event):
-    # --- NEW: Check if the sender is a bot ---
+    # Ignore messages from other bots
     if event.sender.bot:
         return
 
     await event.respond(
         "Hello! I am the advanced Unzipper Bot.\n\n"
-        "Send me a ZIP or 7z file. I will process it in memory. "
-        "This works for files > 20 MB, but is limited by Heroku's RAM (~512MB)."
+        "Send me a ZIP or 7z file. I will use the server disk to process it. "
+        "This is slower but handles larger files."
     )
 
 @client.on(events.NewMessage(func=lambda e: e.document is not None))
 async def document_handler(event):
-    # --- NEW: Check if the sender is a bot. If so, do nothing. ---
+    # Ignore files sent by other bots
     if event.sender.bot:
         return
-        
-    # --- OPTIONAL: Uncomment the lines below to restrict bot usage ---
-    # if event.sender_id not in ALLOWED_USERS:
-    #     await event.respond("Sorry, you are not authorized to use this bot.")
-    #     return
 
     doc = event.document
     file_name = doc.attributes[0].file_name
@@ -57,46 +60,59 @@ async def document_handler(event):
     if not (is_zip or is_7z):
         return
 
-    status_message = await event.respond(f"Downloading `{file_name}` into memory...")
+    # Create a unique directory for this request on the disk
+    request_path = os.path.join(TEMP_DIR, str(event.chat_id) + "_" + str(event.message.id))
+    download_path = os.path.join(request_path, file_name)
+    extract_path = os.path.join(request_path, "extracted")
+    os.makedirs(extract_path, exist_ok=True)
     
+    status_message = await event.respond(f"Downloading `{file_name}` to server disk...")
+
     try:
-        file_buffer = io.BytesIO(await event.download_media(file=bytes))
-        await client.edit_message(status_message, "Download complete. Extracting from memory...")
+        # 1. Download the file TO DISK (not to memory)
+        await client.download_media(
+            message=event.message,
+            file=download_path
+        )
+        await client.edit_message(status_message, "Download complete. Extracting files from disk...")
 
-        archive_name = "archive"
+        # 2. Extract the archive from the file on disk
         if is_zip:
-            archive = zipfile.ZipFile(file_buffer)
-            file_list = archive.infolist()
+            with zipfile.ZipFile(download_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_path)
         elif is_7z:
-            archive = py7zr.SevenZipFile(file_buffer, mode='r')
-            file_list = archive.list()
+            with py7zr.SevenZipFile(download_path, mode='r') as z:
+                z.extractall(path=extract_path)
         
-        await client.edit_message(status_message, f"Found {len(file_list)} files. Starting upload...")
+        await client.edit_message(status_message, "Extraction complete. Now uploading...")
         
+        # 3. Iterate and upload each file from the disk
         file_count = 0
-        for item in file_list:
-            if not (is_zip and item.is_dir()):
-                inner_filename = item.filename if is_zip else item.filename
-
-                if is_zip:
-                    inner_file_bytes = archive.read(inner_filename)
-                elif is_7z:
-                    all_files_dict = archive.readall()
-                    inner_file_bytes = all_files_dict[inner_filename].read()
-
-                await client.send_file(
-                    event.chat_id,
-                    file=inner_file_bytes,
-                    attributes=[types.DocumentAttributeFilename(file_name=inner_filename)]
-                )
+        for root, dirs, files in os.walk(extract_path):
+            for inner_filename in files:
+                file_path = os.path.join(root, inner_filename)
+                # We can use the caption parameter to set the filename for the user
+                await client.send_file(event.chat_id, file=file_path, caption=inner_filename)
                 file_count += 1
         
         await client.edit_message(status_message, f"Upload complete! Sent {file_count} file(s).")
 
     except Exception as e:
         logger.error(f"An error occurred: {e}", exc_info=True)
-        await client.edit_message(status_message, f"An error occurred: {e}\n\nThis might be because the file is too large for Heroku's RAM.")
+        await client.edit_message(status_message, f"An error occurred: {e}")
+    finally:
+        # 4. CRITICAL: Clean up the files from the disk to save space
+        cleanup(request_path)
 
-print("Bot is starting...")
-client.start()
-client.run_until_disconnected()
+# --- Main Function to Run the Bot ---
+def main():
+    # Create the temp directory if it doesn't exist
+    if not os.path.exists(TEMP_DIR):
+        os.makedirs(TEMP_DIR)
+        
+    print("Bot is starting...")
+    client.start()
+    client.run_until_disconnected()
+
+if __name__ == '__main__':
+    main()
